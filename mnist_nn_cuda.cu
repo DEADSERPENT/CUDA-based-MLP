@@ -184,7 +184,7 @@ __global__ void one_learning_cycle(float* train_image, int* train_label, float* 
 		}
 
 		// back propagate
-		for (int l=ns.L-2; l>-1; l--){
+		for (int l=ns.L-2; l>0; l--){
 			float wxd[IMAGE_SIZE];
 			weight_x_d(&weights[ns.weights_pstn[l]], &delta[ns.dza_pstn[l+1]],
 			wxd, ns.layers[l], ns.layers[l+1]);

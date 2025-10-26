@@ -87,6 +87,14 @@ float sigmoid_prime(float z) {
     return sigmoid(z) * (1.0f - sigmoid(z));
 }
 
+float relu(float z) {
+    return fmaxf(0.0f, z);
+}
+
+float relu_prime(float z) {
+    return (z > 0.0f) ? 1.0f : 0.0f;
+}
+
 void softmax(float* a, float* z, int l) {
     float sum = 0.0f;
     float max_z = z[0];
@@ -120,7 +128,7 @@ void forward_prop(float image[IMAGE_SIZE], float* weights, float* biases, float*
             softmax(&a[ns.dza_pstn[l]], &z[ns.dza_pstn[l]], ns.layers[l]);
         } else {
             for (int j = 0; j < ns.layers[l]; j++) {
-                a[ns.dza_pstn[l] + j] = sigmoid(z[ns.dza_pstn[l] + j]);
+                a[ns.dza_pstn[l] + j] = relu(z[ns.dza_pstn[l] + j]);
             }
         }
     }
@@ -158,7 +166,7 @@ void forward_back_prop(float image[IMAGE_SIZE], int label, float* weights,
         weight_x_d(&weights[ns.weights_pstn[l]], &deltas[ns.dza_pstn[l + 1]],
                    wxd, ns.layers[l], ns.layers[l + 1]);
         for (int i = 0; i < ns.layers[l]; i++) {
-            deltas[ns.dza_pstn[l] + i] = wxd[i] * sigmoid_prime(z[ns.dza_pstn[l] + i]);
+            deltas[ns.dza_pstn[l] + i] = wxd[i] * relu_prime(z[ns.dza_pstn[l] + i]);
         }
     }
 }
