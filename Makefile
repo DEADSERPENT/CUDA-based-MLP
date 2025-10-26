@@ -2,7 +2,7 @@ COMPILER1 = gcc
 CFLAGS1 = -g -lm
 
 COMPILER2 = nvcc
-CFLAGS2 = -arch sm_70 -g -G
+CFLAGS2 = -arch sm_86 -g -G
 
 all: serial cuda
 

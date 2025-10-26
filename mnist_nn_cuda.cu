@@ -1,7 +1,3 @@
-/* Input Example:
- * ./cuda 2 30 300 6000 0.1 1 100
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -63,23 +59,42 @@ __device__ void weight_x_d(float* weights, float* d, float* wxd, int l_num, int 
 	}
 }
 
+__host__ __device__ float relu(float z){
+    return fmaxf(0.0f, z);
+}
+
+__device__ float relu_prime(float z){
+    return (z > 0.0f) ? 1.0f : 0.0f;
+}
+
 __host__ __device__ float sigmoid(float z){
-	return (1.0 / (1.0 + exp(-z)));
+    return (1.0 / (1.0 + exp(-z)));
 }
 
 __device__ float sigmoid_prime(float z){
-	return sigmoid(z) * (1.0 - sigmoid(z));
+    return sigmoid(z) * (1.0 - sigmoid(z));
 }
 
 __host__ __device__ void softmax(float* a, float* z, int l){
-	float sum = 0.0;
-	for (int j=0; j<l; j++){
-		a[j] = exp(z[j]);
-		sum += exp(z[j]);
-	}
-	for (int j=0; j<l; j++){
-		a[j] = a[j] / sum;
-	}
+    // Find the maximum value in z for numerical stability
+    float max_z = z[0];
+    for (int i = 1; i < l; i++) {
+        if (z[i] > max_z) {
+            max_z = z[i];
+        }
+    }
+
+    // Calculate the exponentials and the sum
+    float sum = 0.0f;
+    for (int j = 0; j < l; j++) {
+        a[j] = expf(z[j] - max_z); // Subtract max_z to prevent overflow
+        sum += a[j];
+    }
+
+    // Normalize to get the probabilities
+    for (int j = 0; j < l; j++) {
+        a[j] = a[j] / sum;
+    }
 }
 
 __host__ __device__ void forward_prop(float image[IMAGE_SIZE], float* weights, float* biases, float* a,
@@ -99,7 +114,7 @@ __host__ __device__ void forward_prop(float image[IMAGE_SIZE], float* weights, f
 		}
 		else {
 			for (int j=0; j<ns.layers[l]; j++){
-				a[ns.dza_pstn[l]+j] = sigmoid(z[ns.dza_pstn[l]+j]);
+				a[ns.dza_pstn[l]+j] = relu(z[ns.dza_pstn[l]+j]);
 			}
 		}
 	}
@@ -118,7 +133,7 @@ __host__ float evaluate(float image[][IMAGE_SIZE], int num_images, int label[NUM
 			yhat[j] = a[ns.dza_pstn[ns.L-1]+j];
 		}
 		if (argmax(yhat) == label[i]) ctr += 1;
-		// free(z); free(a);
+		free(z); free(a);
 	}
 	return ((float) ctr/num_images);
 }
@@ -174,17 +189,24 @@ __global__ void one_learning_cycle(float* train_image, int* train_label, float* 
 			weight_x_d(&weights[ns.weights_pstn[l]], &delta[ns.dza_pstn[l+1]],
 			wxd, ns.layers[l], ns.layers[l+1]);
 			for (int i=0; i<ns.layers[l]; i++){
-				delta[ns.dza_pstn[l] + i] = wxd[i] * sigmoid_prime(z[ns.dza_pstn[l] + i]);
+				delta[ns.dza_pstn[l] + i] = wxd[i] * relu_prime(z[ns.dza_pstn[l] + i]);
 			}
 		}
 
 		// gradient descent
 		for (int l=0; l<ns.L-1; l++){
+			// --- CORRECTED BIAS UPDATE ---
+			// The biases belong to layer l+1, so we loop over its size.
+			for (int j=0; j<ns.layers[l+1]; j++){
+				atomicAdd(&biases[ns.biases_pstn[l]+j], (- alpha_nb) * delta[ns.dza_pstn[l+1]+j]);
+			}
+
+			// --- WEIGHT UPDATE (Your existing code was correct) ---
+			// Weights connect layer l (size: ns.layers[l]) to layer l+1 (size: ns.layers[l+1]).
 			for (int i=0; i<ns.layers[l]; i++){
-				atomicAdd(&biases[ns.biases_pstn[l]+i], (- alpha_nb) * delta[ns.dza_pstn[l+1]+i]);
 				for (int j=0; j<ns.layers[l+1]; j++){
 					atomicAdd(&weights[ns.weights_pstn[l]+i*ns.layers[l+1]+j],
-					 (- alpha_nb) * delta[ns.dza_pstn[l+1]+j] * a[ns.dza_pstn[l]+i]);
+						(- alpha_nb) * delta[ns.dza_pstn[l+1]+j] * a[ns.dza_pstn[l]+i]);
 				}
 			}
 		}
@@ -248,7 +270,7 @@ int main(const int argc, const char** argv){
 	int seed = 42; srand(seed);
 	// Xavier initialization. Reference: http://bit.ly/3F6uL0J
     for(int l = 0; l < ns.L-1; l++) {
-        float sigma = 1.0f / (sqrtf((float)ns.layers[l]));
+        float sigma = sqrtf(2.0f / (float)ns.layers[l]);
         for(int i = 0; i < ns.layers[l]; i++) {
             for(int j = 0; j < ns.layers[l+1]; j++) {
                 weights[ns.weights_pstn[l] + i*ns.layers[l+1] + j] = rand_normal(0.0f, sigma);
@@ -288,7 +310,7 @@ int main(const int argc, const char** argv){
 	assert(cudaMemcpy(train_label_d, train_label, NUM_TRAIN*sizeof(int), cudaMemcpyHostToDevice)==cudaSuccess);
 
 	// train NN
-	float alpha_nb = alpha/nb;
+	float alpha_nb = alpha / nb;
 	for (int epoch=0; epoch<ne; epoch++){
 		// output progresses
 		if (epoch % log_interval == 0){
