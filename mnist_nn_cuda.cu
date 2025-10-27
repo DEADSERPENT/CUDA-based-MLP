@@ -120,31 +120,89 @@ __host__ __device__ void forward_prop(float image[IMAGE_SIZE], float* weights, f
 	}
 }
 
-__host__ float evaluate(float image[][IMAGE_SIZE], int num_images, int label[NUM_TRAIN],
- float* weights, float* biases, int output_type, struct network_structure ns){
+// GPU kernel for parallel evaluation - MASSIVE SPEEDUP!
+__global__ void evaluate_kernel(float* image_data, int* labels, float* weights,
+ float* biases, int* correct_count, int num_images, int output_type,
+ struct network_structure ns){
 
-	int ctr = 0;
-	float yhat[LABEL_SIZE];
-	for (int i=0; i<num_images; i++){
-		float* z = (float*) calloc(ns.num_nodes, sizeof(float));
-		float* a = (float*) calloc(ns.num_nodes, sizeof(float));
-		forward_prop(image[i], weights, biases, a, z, output_type, ns);
-		for (int j=0; j<LABEL_SIZE; j++){
-			yhat[j] = a[ns.dza_pstn[ns.L-1]+j];
+	int id = threadIdx.x + blockDim.x * blockIdx.x;
+	if (id < num_images){
+		// Allocate per-thread memory on stack (fast!)
+		float z[1024];
+		float a[1024];
+
+		// Get image for this thread
+		float* image = &image_data[IMAGE_SIZE * id];
+		int label = labels[id];
+
+		// Forward propagation - each thread processes one image
+		for (int i=0; i<IMAGE_SIZE; i++) a[i] = image[i];
+
+		for (int l=1; l<ns.L; l++){
+			float wxa[IMAGE_SIZE];
+			weight_x_a(&weights[ns.weights_pstn[l-1]], &a[ns.dza_pstn[l-1]],
+			 wxa, ns.layers[l-1], ns.layers[l]);
+			for (int j=0; j<ns.layers[l]; j++){
+				z[ns.dza_pstn[l]+j] = wxa[j] + biases[ns.biases_pstn[l-1]+j];
+			}
+			if ((l == ns.L-1) && output_type){
+				softmax(&a[ns.dza_pstn[l]], &z[ns.dza_pstn[l]], ns.layers[l]);
+			}
+			else {
+				for (int j=0; j<ns.layers[l]; j++){
+					a[ns.dza_pstn[l]+j] = relu(z[ns.dza_pstn[l]+j]);
+				}
+			}
 		}
-		if (argmax(yhat) == label[i]) ctr += 1;
-		free(z); free(a);
+
+		// Find argmax
+		float maxval = -1.0;
+		int maxidx = -1;
+		for (int i=0; i<LABEL_SIZE; i++){
+			float val = a[ns.dza_pstn[ns.L-1]+i];
+			if (val > maxval){
+				maxval = val;
+				maxidx = i;
+			}
+		}
+
+		// Increment counter if correct (atomic operation)
+		if (maxidx == label){
+			atomicAdd(correct_count, 1);
+		}
 	}
-	return ((float) ctr/num_images);
 }
 
-__host__ void log_train_progress(float train_image[][IMAGE_SIZE], int train_label[NUM_TRAIN],
- float test_image[][IMAGE_SIZE], int test_label[NUM_TEST], int epoch, float* weights,
- float* biases, int output_type, struct network_structure ns){
+// GPU-accelerated evaluation function
+__host__ float evaluate_gpu(float* image_d, int* label_d, int num_images,
+ float* weights_d, float* biases_d, int output_type, struct network_structure ns){
 
-	float acc_train = evaluate(train_image, NUM_TRAIN, train_label, weights, biases, output_type, ns);
-	float acc_test = evaluate(test_image, NUM_TEST, test_label, weights, biases, output_type, ns);
-	printf("Epoch %d: Train %0.5f, Test %0.5f\n", epoch, acc_train, acc_test);
+	int* correct_d;
+	int correct_h = 0;
+	cudaMalloc((void**)&correct_d, sizeof(int));
+	cudaMemcpy(correct_d, &correct_h, sizeof(int), cudaMemcpyHostToDevice);
+
+	// Launch kernel with many threads in parallel!
+	int nthreads = 256;
+	int nblocks = (num_images + nthreads - 1) / nthreads;
+
+	evaluate_kernel<<<nblocks, nthreads>>>(image_d, label_d, weights_d,
+		biases_d, correct_d, num_images, output_type, ns);
+
+	cudaMemcpy(&correct_h, correct_d, sizeof(int), cudaMemcpyDeviceToHost);
+	cudaFree(correct_d);
+
+	return ((float)correct_h / num_images);
+}
+
+__host__ void log_train_progress_gpu(float* train_image_d, int* train_label_d,
+ float* test_image_d, int* test_label_d, int epoch, float* weights_d,
+ float* biases_d, int output_type, struct network_structure ns){
+
+	// Evaluate entirely on GPU - Match serial version (10k train samples for speed)
+	float acc_train = evaluate_gpu(train_image_d, train_label_d, 10000, weights_d, biases_d, output_type, ns);
+	float acc_test = evaluate_gpu(test_image_d, test_label_d, NUM_TEST, weights_d, biases_d, output_type, ns);
+	printf("Epoch %d: Train %0.5f, Test %0.5f", epoch, acc_train, acc_test);
 }
 
 __host__ __device__ void delta_cross_entropy(float* deltas, float* a_list, int label){
@@ -290,8 +348,10 @@ int main(const int argc, const char** argv){
 	cudaEventCreate(&start_device);
 	cudaEventCreate(&stop_device);
 
-	float *weights_d, *biases_d, *deltas_d, *z_list_d, *a_list_d, *train_image_d;
-	int *train_label_d, *batch_d;
+	float *weights_d, *biases_d, *deltas_d, *z_list_d, *a_list_d, *train_image_d, *test_image_d;
+	int *train_label_d, *test_label_d, *batch_d;
+
+	// Allocate GPU memory
 	assert(cudaMalloc((void **) &weights_d, ((784*nh)+(nh*nh)*(nl-1)+(nh*10))*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &biases_d, (nh*nl+10)*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &deltas_d, ns.num_nodes*nb*sizeof(float))==cudaSuccess);
@@ -299,8 +359,11 @@ int main(const int argc, const char** argv){
 	assert(cudaMalloc((void **) &a_list_d, ns.num_nodes*nb*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &train_image_d, IMAGE_SIZE*NUM_TRAIN*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &train_label_d, NUM_TRAIN*sizeof(int))==cudaSuccess);
+	assert(cudaMalloc((void **) &test_image_d, IMAGE_SIZE*NUM_TEST*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &test_label_d, NUM_TEST*sizeof(int))==cudaSuccess);
 	assert(cudaMalloc((void **) &batch_d, nb*sizeof(int))==cudaSuccess);
 
+	// Copy data to GPU (one-time transfer)
 	assert(cudaMemcpy(weights_d, weights, ((784*nh)+(nh*nh)*(nl-1)+(nh*10))*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(biases_d, biases, (nh*nl+10)*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(deltas_d, deltas, ns.num_nodes*nb*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
@@ -308,19 +371,18 @@ int main(const int argc, const char** argv){
 	assert(cudaMemcpy(a_list_d, a_list, ns.num_nodes*nb*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(train_image_d, train_image, IMAGE_SIZE*NUM_TRAIN*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(train_label_d, train_label, NUM_TRAIN*sizeof(int), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(test_image_d, test_image, IMAGE_SIZE*NUM_TEST*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(test_label_d, test_label, NUM_TEST*sizeof(int), cudaMemcpyHostToDevice)==cudaSuccess);
 
 	// train NN
 	float alpha_nb = alpha / nb;
 	for (int epoch=0; epoch<ne; epoch++){
-		// output progresses
+		// output progresses - now using GPU evaluation (MUCH FASTER!)
 		if (epoch % log_interval == 0){
-			if (epoch != 0) {
-				assert(cudaMemcpy(biases, biases_d, (nh*nl+10)*sizeof(float), cudaMemcpyDeviceToHost)==cudaSuccess);
-				assert(cudaMemcpy(weights, weights_d, ((784*nh)+(nh*nh)*(nl-1)+(nh*10))*sizeof(float), cudaMemcpyDeviceToHost)==cudaSuccess);
-			}
-			log_train_progress(train_image, train_label, test_image, test_label, epoch,
-			 weights, biases, output_type, ns);
-			if (epoch != 0) printf("  Agerage time per epoch: %f sec\n", avgTime);
+			log_train_progress_gpu(train_image_d, train_label_d, test_image_d, test_label_d, epoch,
+			 weights_d, biases_d, output_type, ns);
+			if (epoch != 0) printf("  Average time per epoch: %f sec\n", avgTime);
+			else printf("\n");
 		}
 
 		// prepare batch
@@ -348,12 +410,14 @@ int main(const int argc, const char** argv){
 	}
 
 	// output final result
-	log_train_progress(train_image, train_label, test_image, test_label, ne,
-	 weights, biases, output_type, ns);
-	printf("  Agerage time per epoch: %f sec\n", avgTime);
+	log_train_progress_gpu(train_image_d, train_label_d, test_image_d, test_label_d, ne,
+	 weights_d, biases_d, output_type, ns);
+	printf("  Average time per epoch: %f sec\n", avgTime);
 
+	// Cleanup GPU memory
 	cudaFree(weights_d); cudaFree(biases_d); cudaFree(deltas_d); cudaFree(z_list_d);
-	cudaFree(a_list_d); cudaFree(train_image_d); cudaFree(train_label_d); cudaFree(batch_d);
+	cudaFree(a_list_d); cudaFree(train_image_d); cudaFree(train_label_d);
+	cudaFree(test_image_d); cudaFree(test_label_d); cudaFree(batch_d);
 	free(deltas); free(z_list); free(a_list); free(weights); free(biases);
 	return 0;
 }
