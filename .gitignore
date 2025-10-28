@@ -1,1 +1,33 @@
-venv
+# Python virtual environment
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Compiled CUDA binaries
+cuda
+cuda_batchnorm
+infer
+*.o
+*.out
+
+# Model checkpoints and data
+model_checkpoint.bin
+*.bin
+data/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# System files
+.DS_Store
+Thumbs.db
