@@ -615,8 +615,3 @@ This project is developed for educational purposes as part of academic coursewor
 
 For questions, suggestions, or bug reports, please refer to the course instructor or create an issue in the repository.
 
----
-
-**Last Updated:** October 28, 2025
-**Project Status:** Complete ✅
-**Version:** 1.0 Final
