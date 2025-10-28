@@ -50,10 +50,46 @@ using namespace nvcuda;
 #define MODEL_SAVE_PATH "./model_checkpoint.bin"  // Path to save model weights
 
 // Learning rate scheduling
+#ifndef USE_LR_SCHEDULE
 #define USE_LR_SCHEDULE 0      // Set to 1 to enable learning rate scheduling
+#endif
+#ifndef LR_SCHEDULE_TYPE
 #define LR_SCHEDULE_TYPE 1     // 0=step decay, 1=exponential decay, 2=cosine annealing
+#endif
+#ifndef LR_DECAY_RATE
 #define LR_DECAY_RATE 0.5f     // Multiply LR by this factor (for step/exp decay)
+#endif
+#ifndef LR_DECAY_EPOCHS
 #define LR_DECAY_EPOCHS 5      // Decay every N epochs (for step decay)
+#endif
+
+// Optimizer selection
+#ifndef OPTIMIZER_TYPE
+#define OPTIMIZER_TYPE 0       // 0=SGD, 1=Momentum, 2=Adam
+#endif
+#ifndef MOMENTUM_COEF
+#define MOMENTUM_COEF 0.9f     // Momentum coefficient (for Momentum and Adam)
+#endif
+#ifndef ADAM_BETA1
+#define ADAM_BETA1 0.9f        // Adam first moment decay rate
+#endif
+#ifndef ADAM_BETA2
+#define ADAM_BETA2 0.999f      // Adam second moment decay rate
+#endif
+#ifndef ADAM_EPSILON
+#define ADAM_EPSILON 1e-8f     // Adam numerical stability constant
+#endif
+
+// Batch Normalization
+#ifndef USE_BATCH_NORM
+#define USE_BATCH_NORM 0       // Set to 1 to enable batch normalization
+#endif
+#ifndef BN_EPSILON
+#define BN_EPSILON 1e-5f       // Batch norm numerical stability constant
+#endif
+#ifndef BN_MOMENTUM
+#define BN_MOMENTUM 0.1f       // Running statistics momentum (0.0 - 1.0)
+#endif
 
 struct network_structure {
 	int layers[22];
@@ -62,6 +98,11 @@ struct network_structure {
 	int dza_pstn[22];
 	int num_nodes;
 	int L;
+#if USE_BATCH_NORM
+	int bn_gamma_pstn[22];  // Position of gamma parameters for each layer
+	int bn_beta_pstn[22];   // Position of beta parameters for each layer
+	int num_bn_params;      // Total number of BN parameters (gamma + beta)
+#endif
 };
 
 __host__ float rand_uniform(float a, float b) {
@@ -403,6 +444,195 @@ __device__ void apply_dropout(float* activations, int size, float dropout_rate,
 }
 #endif // USE_DROPOUT
 
+// Optimizer update functions
+#if OPTIMIZER_TYPE == 1 // Momentum
+__device__ void update_param_momentum(float* param, float grad, float* velocity, float lr, float momentum){
+	// Momentum update with atomic operations
+	// v = momentum * v + grad
+	// param = param - lr * v
+	// Rewrite as: v = v + (grad - (1-momentum)*v)
+	atomicAdd(velocity, grad - (1.0f - momentum) * (*velocity));
+	float v_val = *velocity;
+	atomicAdd(param, -lr * v_val);
+}
+#elif OPTIMIZER_TYPE == 2 // Adam
+__device__ void update_param_adam(float* param, float grad, float* m, float* v,
+	float lr, float beta1, float beta2, float epsilon, int t){
+	// Adam update with atomic operations for thread safety
+	// m = beta1 * m + (1 - beta1) * grad
+	// v = beta2 * v + (1 - beta2) * grad^2
+	// m_hat = m / (1 - beta1^t)
+	// v_hat = v / (1 - beta2^t)
+	// param = param - lr * m_hat / (sqrt(v_hat) + epsilon)
+
+	// Atomically update first moment using atomicAdd
+	// Instead of m = beta1 * m + (1-beta1) * grad
+	// We do: m = m + [(1-beta1) * grad - (1-beta1) * m]
+	atomicAdd(m, (1.0f - beta1) * (grad - (*m)));
+
+	// Atomically update second moment
+	atomicAdd(v, (1.0f - beta2) * (grad * grad - (*v)));
+
+	// Read updated moments (note: slight race condition but acceptable)
+	float m_val = *m;
+	float v_val = *v;
+
+	// Bias correction
+	float m_hat = m_val / (1.0f - powf(beta1, (float)t));
+	float v_hat = v_val / (1.0f - powf(beta2, (float)t));
+
+	// Parameter update
+	float update = lr * m_hat / (sqrtf(v_hat) + epsilon);
+	atomicAdd(param, -update);
+}
+#endif
+
+#if USE_BATCH_NORM
+// Batch Normalization forward pass
+// Normalizes activations across the batch dimension
+// Handles strided memory layout: each sample's full activations are contiguous
+__device__ void batch_norm_forward(float* z_list, int layer_offset, int layer_size,
+	int num_nodes, int batch_size, float* gamma, float* beta,
+	float* batch_mean, float* batch_var, int gamma_offset){
+
+	// Compute batch mean for each neuron in this layer
+	for (int i = 0; i < layer_size; i++){
+		float sum = 0.0f;
+		// Sum across all samples (strided access)
+		for (int b = 0; b < batch_size; b++){
+			sum += z_list[b * num_nodes + layer_offset + i];
+		}
+		batch_mean[i] = sum / (float)batch_size;
+	}
+
+	// Compute batch variance for each neuron
+	for (int i = 0; i < layer_size; i++){
+		float sum = 0.0f;
+		for (int b = 0; b < batch_size; b++){
+			float val = z_list[b * num_nodes + layer_offset + i];
+			float diff = val - batch_mean[i];
+			sum += diff * diff;
+		}
+		batch_var[i] = sum / (float)batch_size;
+	}
+
+	// Normalize and apply affine transformation (scale and shift)
+	for (int b = 0; b < batch_size; b++){
+		for (int i = 0; i < layer_size; i++){
+			int idx = b * num_nodes + layer_offset + i;
+			float normalized = (z_list[idx] - batch_mean[i]) / sqrtf(batch_var[i] + BN_EPSILON);
+			// Apply learned scale (gamma) and shift (beta)
+			z_list[idx] = gamma[gamma_offset + i] * normalized + beta[gamma_offset + i];
+		}
+	}
+}
+
+// Batch Normalization forward pass for a single sample
+// Each thread computes batch statistics independently (redundant but avoids synchronization)
+__device__ void batch_norm_forward_sample(float* z_list, int sample_id, int layer_offset,
+	int layer_size, int num_nodes, int batch_size, float* gamma, float* beta,
+	float* batch_mean_local, float* batch_var_local, int gamma_offset){
+
+	// Compute batch mean for each neuron (all threads compute same values - redundant but simple)
+	for (int i = 0; i < layer_size; i++){
+		float sum = 0.0f;
+		for (int b = 0; b < batch_size; b++){
+			sum += z_list[b * num_nodes + layer_offset + i];
+		}
+		batch_mean_local[i] = sum / (float)batch_size;
+	}
+
+	// Compute batch variance
+	for (int i = 0; i < layer_size; i++){
+		float sum = 0.0f;
+		for (int b = 0; b < batch_size; b++){
+			float val = z_list[b * num_nodes + layer_offset + i];
+			float diff = val - batch_mean_local[i];
+			sum += diff * diff;
+		}
+		batch_var_local[i] = sum / (float)batch_size;
+	}
+
+	// Apply normalization to THIS sample only (no race condition)
+	for (int i = 0; i < layer_size; i++){
+		int idx = sample_id * num_nodes + layer_offset + i;
+		float normalized = (z_list[idx] - batch_mean_local[i]) / sqrtf(batch_var_local[i] + BN_EPSILON);
+		z_list[idx] = gamma[gamma_offset + i] * normalized + beta[gamma_offset + i];
+	}
+}
+
+// Batch Normalization backward pass
+// Handles strided memory layout: each sample's full gradients/activations are contiguous
+__device__ void batch_norm_backward(float* delta_list, float* z_list, int layer_offset,
+	int layer_size, int num_nodes, int batch_size, float* gamma, float* beta,
+	float* dgamma, float* dbeta, float* batch_mean, float* batch_var, int gamma_offset){
+
+	// Compute dgamma and dbeta (gradients w.r.t. scale and shift parameters)
+	for (int i = 0; i < layer_size; i++){
+		float dg = 0.0f, db = 0.0f;
+		for (int b = 0; b < batch_size; b++){
+			int idx = b * num_nodes + layer_offset + i;
+			// Recover normalized value from post-BN value
+			// z_list[idx] = gamma * normalized + beta, so: normalized = (z - beta) / gamma
+			float z_postBN = z_list[idx];
+			float normalized = (z_postBN - beta[gamma_offset + i]) / (gamma[gamma_offset + i] + 1e-10f);
+			// Accumulate gradients
+			dg += delta_list[idx] * normalized;
+			db += delta_list[idx];
+		}
+		// Atomic add to handle concurrent updates from multiple threads
+		atomicAdd(&dgamma[gamma_offset + i], dg);
+		atomicAdd(&dbeta[gamma_offset + i], db);
+	}
+
+	// Compute gradient w.r.t. input (dz) using chain rule
+	// Recover original z values from post-BN values: z_orig = normalized * sqrt(var + eps) + mean
+	// where normalized = (z_postBN - beta) / gamma
+	float inv_batch_size = 1.0f / (float)batch_size;
+	for (int i = 0; i < layer_size; i++){
+		float std = sqrtf(batch_var[i] + BN_EPSILON);
+		float std_inv = 1.0f / std;
+		float dvar_sum = 0.0f;
+		float dmean_sum = 0.0f;
+
+		// Gradient w.r.t. variance
+		for (int b = 0; b < batch_size; b++){
+			int idx = b * num_nodes + layer_offset + i;
+			float z_postBN = z_list[idx];
+			// Recover normalized value
+			float normalized = (z_postBN - beta[gamma_offset + i]) / (gamma[gamma_offset + i] + 1e-10f);
+			// Recover original z
+			float z_orig = normalized * std + batch_mean[i];
+			float z_centered = z_orig - batch_mean[i];
+			dvar_sum += delta_list[idx] * gamma[gamma_offset + i] * z_centered * (-0.5f) * powf(std_inv, 3.0f);
+		}
+
+		// Gradient w.r.t. mean
+		for (int b = 0; b < batch_size; b++){
+			int idx = b * num_nodes + layer_offset + i;
+			float z_postBN = z_list[idx];
+			float normalized = (z_postBN - beta[gamma_offset + i]) / (gamma[gamma_offset + i] + 1e-10f);
+			float z_orig = normalized * std + batch_mean[i];
+			float z_centered = z_orig - batch_mean[i];
+			dmean_sum += delta_list[idx] * gamma[gamma_offset + i] * (-std_inv) +
+						 dvar_sum * (-2.0f) * z_centered * inv_batch_size;
+		}
+
+		// Final gradient w.r.t. input
+		for (int b = 0; b < batch_size; b++){
+			int idx = b * num_nodes + layer_offset + i;
+			float z_postBN = z_list[idx];
+			float normalized = (z_postBN - beta[gamma_offset + i]) / (gamma[gamma_offset + i] + 1e-10f);
+			float z_orig = normalized * std + batch_mean[i];
+			float z_centered = z_orig - batch_mean[i];
+			delta_list[idx] = delta_list[idx] * gamma[gamma_offset + i] * std_inv +
+							  dvar_sum * 2.0f * z_centered * inv_batch_size +
+							  dmean_sum * inv_batch_size;
+		}
+	}
+}
+#endif // USE_BATCH_NORM
+
 __host__ __device__ void softmax(float* a, float* z, int l){
     // Find the maximum value in z for numerical stability
     float max_z = z[0];
@@ -677,7 +907,16 @@ __host__ int load_model(const char* filepath, float* weights, float* biases,
 
 __global__ void one_learning_cycle(float* train_image, int* train_label, float* weights,
  float* biases, float* deltas, float* a_list, float* z_list, int* batch_d, int output_type,
- struct network_structure ns, int nb, float alpha_nb){
+ struct network_structure ns, int nb, float alpha_nb, int epoch
+#if OPTIMIZER_TYPE == 1 // Momentum
+ , float* velocity_w, float* velocity_b
+#elif OPTIMIZER_TYPE == 2 // Adam
+ , float* m_w, float* v_w, float* m_b, float* v_b
+#endif
+#if USE_BATCH_NORM
+ , float* bn_gamma, float* bn_beta, float* bn_mean, float* bn_var, float* dgamma, float* dbeta
+#endif
+){
 
 	// Allocate shared memory for cooperative loading
 	__shared__ float shared_weights[TILE_SIZE * TILE_SIZE];
@@ -695,9 +934,48 @@ __global__ void one_learning_cycle(float* train_image, int* train_label, float* 
 		float* z = &z_list[ns.num_nodes*id];
 		float* delta = &deltas[ns.num_nodes*id];
 
-		// feedforward - using forward_prop which we'll keep as is for simplicity
-		// (Could be optimized further by integrating shared memory directly)
+		// feedforward
+#if USE_BATCH_NORM
+		// With BN enabled, manually implement forward pass to properly integrate BN
+		// between linear transformation and activation
+		float bn_mean_all[10][256];  // Max 10 layers, 256 neurons per layer
+		float bn_var_all[10][256];
+
+		// Input layer
+		for (int i=0; i<IMAGE_SIZE; i++) a[i] = image[i];
+
+		// Hidden and output layers
+		for (int l=1; l<ns.L; l++){
+			float wxa[IMAGE_SIZE];
+			weight_x_a(&weights[ns.weights_pstn[l-1]], &a[ns.dza_pstn[l-1]],
+				wxa, ns.layers[l-1], ns.layers[l]);
+
+			// Compute z = W*a + b
+			for (int j=0; j<ns.layers[l]; j++){
+				z[ns.dza_pstn[l]+j] = wxa[j] + biases[ns.biases_pstn[l-1]+j];
+			}
+
+			// Apply BN to hidden layers (not output layer)
+			if (l < ns.L-1){
+				batch_norm_forward_sample(z_list, id, ns.dza_pstn[l], ns.layers[l],
+					ns.num_nodes, nb, bn_gamma, bn_beta, bn_mean_all[l], bn_var_all[l],
+					ns.bn_gamma_pstn[l]);
+			}
+
+			// Apply activation function
+			if ((l == ns.L-1) && output_type){
+				softmax(&a[ns.dza_pstn[l]], &z[ns.dza_pstn[l]], ns.layers[l]);
+			}
+			else {
+				for (int j=0; j<ns.layers[l]; j++){
+					a[ns.dza_pstn[l]+j] = relu(z[ns.dza_pstn[l]+j]);
+				}
+			}
+		}
+#else
+		// Without BN, use the optimized forward_prop function
 		forward_prop(image, weights, biases, a, z, output_type, ns, id);
+#endif
 
 #if USE_DROPOUT
 		// Apply dropout to hidden layer activations (not input or output)
@@ -747,25 +1025,92 @@ __global__ void one_learning_cycle(float* train_image, int* train_label, float* 
 			for (int i=0; i<ns.layers[l]; i++){
 				delta[ns.dza_pstn[l] + i] = wxd[i] * relu_prime(z[ns.dza_pstn[l] + i]);
 			}
+
+#if USE_BATCH_NORM
+			// Apply BN backward pass if this layer has BN
+			// This computes gradient w.r.t. BN input and updates gamma/beta gradients
+			// Use the saved statistics from the forward pass
+			if (l < ns.L-1){  // BN applied to hidden layers only
+				batch_norm_backward(deltas, z_list, ns.dza_pstn[l], ns.layers[l],
+					ns.num_nodes, nb, bn_gamma, bn_beta, dgamma, dbeta,
+					bn_mean_all[l], bn_var_all[l], ns.bn_gamma_pstn[l]);
+			}
+#endif
 		}
 
-		// gradient descent
+		// gradient descent with selected optimizer
 		for (int l=0; l<ns.L-1; l++){
-			// --- CORRECTED BIAS UPDATE ---
-			// The biases belong to layer l+1, so we loop over its size.
+			// Bias updates
 			for (int j=0; j<ns.layers[l+1]; j++){
-				atomicAdd(&biases[ns.biases_pstn[l]+j], (- alpha_nb) * delta[ns.dza_pstn[l+1]+j]);
+				float grad_b = delta[ns.dza_pstn[l+1]+j];
+				int bias_idx = ns.biases_pstn[l]+j;
+
+#if OPTIMIZER_TYPE == 0 // SGD
+				atomicAdd(&biases[bias_idx], (-alpha_nb) * grad_b);
+#elif OPTIMIZER_TYPE == 1 // Momentum
+				update_param_momentum(&biases[bias_idx], grad_b, &velocity_b[bias_idx], alpha_nb, MOMENTUM_COEF);
+#elif OPTIMIZER_TYPE == 2 // Adam
+				update_param_adam(&biases[bias_idx], grad_b, &m_b[bias_idx], &v_b[bias_idx],
+					alpha_nb, ADAM_BETA1, ADAM_BETA2, ADAM_EPSILON, epoch + 1);
+#endif
 			}
 
-			// --- WEIGHT UPDATE (Your existing code was correct) ---
-			// Weights connect layer l (size: ns.layers[l]) to layer l+1 (size: ns.layers[l+1]).
+			// Weight updates
 			for (int i=0; i<ns.layers[l]; i++){
 				for (int j=0; j<ns.layers[l+1]; j++){
-					atomicAdd(&weights[ns.weights_pstn[l]+i*ns.layers[l+1]+j],
-						(- alpha_nb) * delta[ns.dza_pstn[l+1]+j] * a[ns.dza_pstn[l]+i]);
+					float grad_w = delta[ns.dza_pstn[l+1]+j] * a[ns.dza_pstn[l]+i];
+					int weight_idx = ns.weights_pstn[l]+i*ns.layers[l+1]+j;
+
+#if OPTIMIZER_TYPE == 0 // SGD
+					atomicAdd(&weights[weight_idx], (-alpha_nb) * grad_w);
+#elif OPTIMIZER_TYPE == 1 // Momentum
+					update_param_momentum(&weights[weight_idx], grad_w, &velocity_w[weight_idx], alpha_nb, MOMENTUM_COEF);
+#elif OPTIMIZER_TYPE == 2 // Adam
+					update_param_adam(&weights[weight_idx], grad_w, &m_w[weight_idx], &v_w[weight_idx],
+						alpha_nb, ADAM_BETA1, ADAM_BETA2, ADAM_EPSILON, epoch + 1);
+#endif
 				}
 			}
 		}
+
+#if USE_BATCH_NORM
+		// Update BN parameters (gamma and beta) - only first thread to avoid duplication
+		// Gradients have been accumulated in dgamma/dbeta by all threads via atomicAdd
+		if (id == 0){
+			for (int l=1; l<ns.L-1; l++){  // BN applied to hidden layers only
+				for (int i=0; i<ns.layers[l]; i++){
+					int bn_idx = ns.bn_gamma_pstn[l] + i;
+					float grad_gamma = dgamma[bn_idx];
+					float grad_beta = dbeta[bn_idx];
+
+#if OPTIMIZER_TYPE == 0 // SGD
+					bn_gamma[bn_idx] -= alpha_nb * grad_gamma;
+					bn_beta[bn_idx] -= alpha_nb * grad_beta;
+#elif OPTIMIZER_TYPE == 1 // Momentum
+					// Update gamma
+					velocity_bn_gamma[bn_idx] = MOMENTUM_COEF * velocity_bn_gamma[bn_idx] + grad_gamma;
+					bn_gamma[bn_idx] -= alpha_nb * velocity_bn_gamma[bn_idx];
+					// Update beta
+					velocity_bn_beta[bn_idx] = MOMENTUM_COEF * velocity_bn_beta[bn_idx] + grad_beta;
+					bn_beta[bn_idx] -= alpha_nb * velocity_bn_beta[bn_idx];
+#elif OPTIMIZER_TYPE == 2 // Adam
+					// Update gamma
+					m_bn_gamma[bn_idx] = ADAM_BETA1 * m_bn_gamma[bn_idx] + (1.0f - ADAM_BETA1) * grad_gamma;
+					v_bn_gamma[bn_idx] = ADAM_BETA2 * v_bn_gamma[bn_idx] + (1.0f - ADAM_BETA2) * grad_gamma * grad_gamma;
+					float m_hat_g = m_bn_gamma[bn_idx] / (1.0f - powf(ADAM_BETA1, (float)(epoch + 1)));
+					float v_hat_g = v_bn_gamma[bn_idx] / (1.0f - powf(ADAM_BETA2, (float)(epoch + 1)));
+					bn_gamma[bn_idx] -= alpha_nb * m_hat_g / (sqrtf(v_hat_g) + ADAM_EPSILON);
+					// Update beta
+					m_bn_beta[bn_idx] = ADAM_BETA1 * m_bn_beta[bn_idx] + (1.0f - ADAM_BETA1) * grad_beta;
+					v_bn_beta[bn_idx] = ADAM_BETA2 * v_bn_beta[bn_idx] + (1.0f - ADAM_BETA2) * grad_beta * grad_beta;
+					float m_hat_b = m_bn_beta[bn_idx] / (1.0f - powf(ADAM_BETA1, (float)(epoch + 1)));
+					float v_hat_b = v_bn_beta[bn_idx] / (1.0f - powf(ADAM_BETA2, (float)(epoch + 1)));
+					bn_beta[bn_idx] -= alpha_nb * m_hat_b / (sqrtf(v_hat_b) + ADAM_EPSILON);
+#endif
+				}
+			}
+		}
+#endif
 
 	}
 }
@@ -790,8 +1135,21 @@ int main(const int argc, const char** argv){
 	 "  Number of training samples per batch: %d\n  Learning Rate: %.2f\n"
 	 "  Your activation & cost functions at output layer: %d\n"
 	 "    (0: Sigmoid + MSE   1: Softmax + Cross-Entropy)\n"
-	 "  Save/Load: %d (0=none, 1=save, 2=load+train)\n\n",
+	 "  Save/Load: %d (0=none, 1=save, 2=load+train)\n",
 	 nl, nh, ne, nb, alpha, output_type, save_model_flag);
+
+#if OPTIMIZER_TYPE == 0
+	printf("  Optimizer: SGD\n");
+#elif OPTIMIZER_TYPE == 1
+	printf("  Optimizer: Momentum (coefficient=%.2f)\n", MOMENTUM_COEF);
+#elif OPTIMIZER_TYPE == 2
+	printf("  Optimizer: Adam (beta1=%.3f, beta2=%.3f, eps=%.0e)\n", ADAM_BETA1, ADAM_BETA2, ADAM_EPSILON);
+#endif
+
+#if USE_BATCH_NORM
+	printf("  Batch Normalization: Enabled\n");
+#endif
+	printf("\n");
 
 	// load data
 	load_mnist();
@@ -803,8 +1161,12 @@ int main(const int argc, const char** argv){
 		ns.biases_pstn[i] = 0;
 		ns.dza_pstn[i] = 0;
 		ns.layers[i] = 0;
+#if USE_BATCH_NORM
+		ns.bn_gamma_pstn[i] = 0;
+		ns.bn_beta_pstn[i] = 0;
+#endif
 	}
-	ns.layers[0] = 784; 
+	ns.layers[0] = 784;
 	for (int i=0; i<nl; i++){
 		ns.layers[i+1] = nh;
 		ns.layers[nl+1] = 10;
@@ -819,12 +1181,68 @@ int main(const int argc, const char** argv){
 		ns.dza_pstn[i+1] = ns.layers[i] + ns.dza_pstn[i];
 	}
 
+#if USE_BATCH_NORM
+	// Initialize BN parameter positions (gamma and beta for each hidden + output layer)
+	// We apply BN after each linear layer (before activation)
+	// gamma and beta are stored in separate arrays, so positions are identical
+	ns.num_bn_params = 0;
+	for (int i=1; i<ns.L; i++){  // Start from first hidden layer
+		ns.bn_gamma_pstn[i] = ns.num_bn_params;
+		ns.bn_beta_pstn[i] = ns.num_bn_params;  // Same position (separate arrays)
+		ns.num_bn_params += ns.layers[i];
+	}
+	printf("Batch Normalization: %d gamma + %d beta parameters for %d layers\n",
+		ns.num_bn_params, ns.num_bn_params, ns.L-1);
+#endif
+
 	// allocate memory to NN variables
-	float* weights = (float*) malloc(((784*nh)+(nh*nh)*(nl-1)+(nh*10))*sizeof(float));
-    float* biases = (float*) calloc(nh*nl+10, sizeof(float));
+	int num_weights = (784*nh)+(nh*nh)*(nl-1)+(nh*10);
+	int num_biases = nh*nl+10;
+	float* weights = (float*) malloc(num_weights*sizeof(float));
+    float* biases = (float*) calloc(num_biases, sizeof(float));
     float* deltas = (float*) calloc(ns.num_nodes * nb, sizeof(float));
     float* z_list = (float*) calloc(ns.num_nodes * nb, sizeof(float));
     float* a_list = (float*) calloc(ns.num_nodes * nb, sizeof(float));
+
+#if USE_BATCH_NORM
+	// Allocate memory for BN parameters (gamma and beta)
+	float* bn_gamma = (float*) malloc(ns.num_bn_params * sizeof(float));
+	float* bn_beta = (float*) calloc(ns.num_bn_params, sizeof(float));  // Beta init to 0
+	// Initialize gamma to 1.0 (scale factor)
+	for (int i=0; i<ns.num_bn_params; i++){
+		bn_gamma[i] = 1.0f;
+	}
+	// Allocate memory for batch statistics (mean and variance per layer)
+	// We need one mean/var per neuron across all BN layers
+	float* bn_mean = (float*) calloc(ns.num_bn_params, sizeof(float));
+	float* bn_var = (float*) calloc(ns.num_bn_params, sizeof(float));
+	printf("  BN Memory: %d gamma, %d beta, %d mean, %d var\n",
+		ns.num_bn_params, ns.num_bn_params, ns.num_bn_params, ns.num_bn_params);
+#endif
+
+	// Allocate optimizer state variables
+#if OPTIMIZER_TYPE == 1 // Momentum
+	float* velocity_w = (float*) calloc(num_weights, sizeof(float));
+	float* velocity_b = (float*) calloc(num_biases, sizeof(float));
+#elif OPTIMIZER_TYPE == 2 // Adam
+	float* m_w = (float*) calloc(num_weights, sizeof(float));
+	float* v_w = (float*) calloc(num_weights, sizeof(float));
+	float* m_b = (float*) calloc(num_biases, sizeof(float));
+	float* v_b = (float*) calloc(num_biases, sizeof(float));
+#endif
+
+#if USE_BATCH_NORM && OPTIMIZER_TYPE == 1
+	// Momentum for BN parameters
+	float* velocity_bn_gamma = (float*) calloc(ns.num_bn_params, sizeof(float));
+	float* velocity_bn_beta = (float*) calloc(ns.num_bn_params, sizeof(float));
+#elif USE_BATCH_NORM && OPTIMIZER_TYPE == 2
+	// Adam for BN parameters
+	float* m_bn_gamma = (float*) calloc(ns.num_bn_params, sizeof(float));
+	float* v_bn_gamma = (float*) calloc(ns.num_bn_params, sizeof(float));
+	float* m_bn_beta = (float*) calloc(ns.num_bn_params, sizeof(float));
+	float* v_bn_beta = (float*) calloc(ns.num_bn_params, sizeof(float));
+#endif
+
 	// set random seed for test
 	int seed = 42; srand(seed);
 
@@ -873,8 +1291,8 @@ int main(const int argc, const char** argv){
 	int *train_label_d, *test_label_d, *batch_d;
 
 	// Allocate GPU memory
-	assert(cudaMalloc((void **) &weights_d, ((784*nh)+(nh*nh)*(nl-1)+(nh*10))*sizeof(float))==cudaSuccess);
-	assert(cudaMalloc((void **) &biases_d, (nh*nl+10)*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &weights_d, num_weights*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &biases_d, num_biases*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &deltas_d, ns.num_nodes*nb*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &z_list_d, ns.num_nodes*nb*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &a_list_d, ns.num_nodes*nb*sizeof(float))==cudaSuccess);
@@ -884,9 +1302,65 @@ int main(const int argc, const char** argv){
 	assert(cudaMalloc((void **) &test_label_d, NUM_TEST*sizeof(int))==cudaSuccess);
 	assert(cudaMalloc((void **) &batch_d, nb*sizeof(int))==cudaSuccess);
 
+	// Allocate GPU memory for optimizer state
+#if OPTIMIZER_TYPE == 1 // Momentum
+	float *velocity_w_d, *velocity_b_d;
+	assert(cudaMalloc((void **) &velocity_w_d, num_weights*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &velocity_b_d, num_biases*sizeof(float))==cudaSuccess);
+	assert(cudaMemcpy(velocity_w_d, velocity_w, num_weights*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(velocity_b_d, velocity_b, num_biases*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+#elif OPTIMIZER_TYPE == 2 // Adam
+	float *m_w_d, *v_w_d, *m_b_d, *v_b_d;
+	assert(cudaMalloc((void **) &m_w_d, num_weights*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &v_w_d, num_weights*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &m_b_d, num_biases*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &v_b_d, num_biases*sizeof(float))==cudaSuccess);
+	assert(cudaMemcpy(m_w_d, m_w, num_weights*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(v_w_d, v_w, num_weights*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(m_b_d, m_b, num_biases*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(v_b_d, v_b, num_biases*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+#endif
+
+#if USE_BATCH_NORM
+	// Allocate GPU memory for BN parameters
+	float *bn_gamma_d, *bn_beta_d, *bn_mean_d, *bn_var_d;
+	assert(cudaMalloc((void **) &bn_gamma_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &bn_beta_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &bn_mean_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &bn_var_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+	assert(cudaMemcpy(bn_gamma_d, bn_gamma, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(bn_beta_d, bn_beta, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(bn_mean_d, bn_mean, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(bn_var_d, bn_var, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+
+	// Allocate GPU memory for BN gradient accumulators (for parameter updates)
+	float *dgamma_d, *dbeta_d;
+	assert(cudaMalloc((void **) &dgamma_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &dbeta_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+
+	// Allocate GPU memory for BN optimizer state
+	#if OPTIMIZER_TYPE == 1 // Momentum
+		float *velocity_bn_gamma_d, *velocity_bn_beta_d;
+		assert(cudaMalloc((void **) &velocity_bn_gamma_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+		assert(cudaMalloc((void **) &velocity_bn_beta_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+		assert(cudaMemcpy(velocity_bn_gamma_d, velocity_bn_gamma, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+		assert(cudaMemcpy(velocity_bn_beta_d, velocity_bn_beta, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	#elif OPTIMIZER_TYPE == 2 // Adam
+		float *m_bn_gamma_d, *v_bn_gamma_d, *m_bn_beta_d, *v_bn_beta_d;
+		assert(cudaMalloc((void **) &m_bn_gamma_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+		assert(cudaMalloc((void **) &v_bn_gamma_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+		assert(cudaMalloc((void **) &m_bn_beta_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+		assert(cudaMalloc((void **) &v_bn_beta_d, ns.num_bn_params*sizeof(float))==cudaSuccess);
+		assert(cudaMemcpy(m_bn_gamma_d, m_bn_gamma, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+		assert(cudaMemcpy(v_bn_gamma_d, v_bn_gamma, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+		assert(cudaMemcpy(m_bn_beta_d, m_bn_beta, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+		assert(cudaMemcpy(v_bn_beta_d, v_bn_beta, ns.num_bn_params*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	#endif
+#endif
+
 	// Copy data to GPU (one-time transfer)
-	assert(cudaMemcpy(weights_d, weights, ((784*nh)+(nh*nh)*(nl-1)+(nh*10))*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
-	assert(cudaMemcpy(biases_d, biases, (nh*nl+10)*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(weights_d, weights, num_weights*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+	assert(cudaMemcpy(biases_d, biases, num_biases*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(deltas_d, deltas, ns.num_nodes*nb*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(z_list_d, z_list, ns.num_nodes*nb*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(a_list_d, a_list, ns.num_nodes*nb*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
@@ -932,12 +1406,27 @@ int main(const int argc, const char** argv){
 		}
 		assert(cudaMemcpy(batch_d, batch, nb*sizeof(int), cudaMemcpyHostToDevice)==cudaSuccess);
 
+#if USE_BATCH_NORM
+		// Zero out BN gradient accumulators before each training step
+		cudaMemset(dgamma_d, 0, ns.num_bn_params*sizeof(float));
+		cudaMemset(dbeta_d, 0, ns.num_bn_params*sizeof(float));
+#endif
+
 		/* --- main part --- */
 		cudaEventRecord( start_device, 0 ); // record cuda start time
 
 		// one learning cycle (feedforward & backpropagate & gradient descend)
 		one_learning_cycle<<<nblocks, nthreads>>>(train_image_d, train_label_d,
-			weights_d, biases_d, deltas_d, a_list_d, z_list_d, batch_d, output_type, ns, nb, alpha_nb);
+			weights_d, biases_d, deltas_d, a_list_d, z_list_d, batch_d, output_type, ns, nb, alpha_nb, epoch
+#if OPTIMIZER_TYPE == 1 // Momentum
+			, velocity_w_d, velocity_b_d
+#elif OPTIMIZER_TYPE == 2 // Adam
+			, m_w_d, v_w_d, m_b_d, v_b_d
+#endif
+#if USE_BATCH_NORM
+			, bn_gamma_d, bn_beta_d, bn_mean_d, bn_var_d, dgamma_d, dbeta_d
+#endif
+		);
 
 		cudaEventRecord( stop_device, 0 ); // record cuda finish time
 		cudaEventSynchronize( stop_device );
@@ -957,8 +1446,8 @@ int main(const int argc, const char** argv){
 	// Save model if requested
 	if (save_model_flag == 1 || save_model_flag == 2){
 		// Copy weights and biases back from GPU before saving
-		cudaMemcpy(weights, weights_d, ((784*nh)+(nh*nh)*(nl-1)+(nh*10))*sizeof(float), cudaMemcpyDeviceToHost);
-		cudaMemcpy(biases, biases_d, (nh*nl+10)*sizeof(float), cudaMemcpyDeviceToHost);
+		cudaMemcpy(weights, weights_d, num_weights*sizeof(float), cudaMemcpyDeviceToHost);
+		cudaMemcpy(biases, biases_d, num_biases*sizeof(float), cudaMemcpyDeviceToHost);
 
 		save_model(MODEL_SAVE_PATH, weights, biases, ns, nl, nh);
 	}
@@ -967,6 +1456,29 @@ int main(const int argc, const char** argv){
 	cudaFree(weights_d); cudaFree(biases_d); cudaFree(deltas_d); cudaFree(z_list_d);
 	cudaFree(a_list_d); cudaFree(train_image_d); cudaFree(train_label_d);
 	cudaFree(test_image_d); cudaFree(test_label_d); cudaFree(batch_d);
+
+#if OPTIMIZER_TYPE == 1 // Momentum
+	cudaFree(velocity_w_d); cudaFree(velocity_b_d);
+	free(velocity_w); free(velocity_b);
+#elif OPTIMIZER_TYPE == 2 // Adam
+	cudaFree(m_w_d); cudaFree(v_w_d); cudaFree(m_b_d); cudaFree(v_b_d);
+	free(m_w); free(v_w); free(m_b); free(v_b);
+#endif
+
+#if USE_BATCH_NORM
+	// Cleanup BN memory
+	cudaFree(bn_gamma_d); cudaFree(bn_beta_d); cudaFree(bn_mean_d); cudaFree(bn_var_d);
+	cudaFree(dgamma_d); cudaFree(dbeta_d);
+	free(bn_gamma); free(bn_beta); free(bn_mean); free(bn_var);
+	#if OPTIMIZER_TYPE == 1
+		cudaFree(velocity_bn_gamma_d); cudaFree(velocity_bn_beta_d);
+		free(velocity_bn_gamma); free(velocity_bn_beta);
+	#elif OPTIMIZER_TYPE == 2
+		cudaFree(m_bn_gamma_d); cudaFree(v_bn_gamma_d); cudaFree(m_bn_beta_d); cudaFree(v_bn_beta_d);
+		free(m_bn_gamma); free(v_bn_gamma); free(m_bn_beta); free(v_bn_beta);
+	#endif
+#endif
+
 	free(deltas); free(z_list); free(a_list); free(weights); free(biases);
 	return 0;
 }
