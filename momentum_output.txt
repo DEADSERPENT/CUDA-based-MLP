@@ -1,0 +1,34 @@
+Your Inputs:
+  Number of layers: 2 (Except for input and output layers)
+  Number of units in each layer: 128
+  Number of training epochs: 20
+  Number of training samples per batch: 2048
+  Learning Rate: 0.10
+  Your activation & cost functions at output layer: 1
+    (0: Sigmoid + MSE   1: Softmax + Cross-Entropy)
+  Save/Load: 0 (0=none, 1=save, 2=load+train)
+  Optimizer: Momentum (coefficient=0.90)
+
+Validation split: 48000 training, 12000 validation samples
+
+Epoch 0: Train 0.10450, Val 0.09733, Test 0.10170
+Epoch 1: Train 0.14170, Val 0.13525, Test 0.13380  Average time per epoch: 0.000000 sec
+Epoch 2: Train 0.24750, Val 0.24842, Test 0.23390  Average time per epoch: inf sec
+Epoch 3: Train 0.39370, Val 0.40833, Test 0.38870  Average time per epoch: 0.824435 sec
+Epoch 4: Train 0.53880, Val 0.54950, Test 0.53380  Average time per epoch: 0.618314 sec
+Epoch 5: Train 0.62260, Val 0.63133, Test 0.61350  Average time per epoch: 0.549619 sec
+Epoch 6: Train 0.66340, Val 0.66558, Test 0.66450  Average time per epoch: 0.515542 sec
+Epoch 7: Train 0.69490, Val 0.69258, Test 0.69690  Average time per epoch: 0.495129 sec
+Epoch 8: Train 0.72020, Val 0.71975, Test 0.72100  Average time per epoch: 0.481559 sec
+Epoch 9: Train 0.73920, Val 0.74558, Test 0.74410  Average time per epoch: 0.471850 sec
+Epoch 10: Train 0.74320, Val 0.75175, Test 0.74820  Average time per epoch: 0.464567 sec
+Epoch 11: Train 0.73360, Val 0.74625, Test 0.73770  Average time per epoch: 0.458918 sec
+Epoch 12: Train 0.71930, Val 0.73008, Test 0.72230  Average time per epoch: 0.454379 sec
+Epoch 13: Train 0.72060, Val 0.73567, Test 0.73410  Average time per epoch: 0.450671 sec
+Epoch 14: Train 0.74450, Val 0.75692, Test 0.75370  Average time per epoch: 0.447591 sec
+Epoch 15: Train 0.73330, Val 0.74367, Test 0.74090  Average time per epoch: 0.444988 sec
+Epoch 16: Train 0.69400, Val 0.70867, Test 0.70570  Average time per epoch: 0.442740 sec
+Epoch 17: Train 0.74630, Val 0.75700, Test 0.75550  Average time per epoch: 0.440797 sec
+Epoch 18: Train 0.75120, Val 0.75950, Test 0.75860  Average time per epoch: 0.439109 sec
+Epoch 19: Train 0.70840, Val 0.72258, Test 0.72050  Average time per epoch: 0.437609 sec
+Epoch 20: Train 0.73690, Val 0.74617, Test 0.74650  Average time per epoch: 0.436282 sec
