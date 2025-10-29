@@ -905,16 +905,74 @@ __host__ int load_model(const char* filepath, float* weights, float* biases,
 	return 0;
 }
 
-__global__ void one_learning_cycle(float* train_image, int* train_label, float* weights,
- float* biases, float* deltas, float* a_list, float* z_list, int* batch_d, int output_type,
- struct network_structure ns, int nb, float alpha_nb, int epoch
+// Phase 2: Apply optimizer updates to parameters using accumulated gradients
+// This kernel runs ONCE per batch (not per sample) to correctly implement Momentum/Adam
+__global__ void apply_optimizer_update(float* weights, float* biases,
+ float* grad_w, float* grad_b, int num_weights, int num_biases, float lr, int nb, int epoch
 #if OPTIMIZER_TYPE == 1 // Momentum
  , float* velocity_w, float* velocity_b
 #elif OPTIMIZER_TYPE == 2 // Adam
  , float* m_w, float* v_w, float* m_b, float* v_b
 #endif
+){
+	int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+#if OPTIMIZER_TYPE == 1 // Momentum
+	// Apply Momentum update to weights
+	if (idx < num_weights){
+		float grad = grad_w[idx] / (float)nb;  // Average gradient over batch
+		velocity_w[idx] = MOMENTUM_COEF * velocity_w[idx] + grad;
+		weights[idx] -= lr * velocity_w[idx];
+		grad_w[idx] = 0.0f;  // Reset for next batch
+	}
+	// Apply Momentum update to biases
+	if (idx < num_biases){
+		float grad = grad_b[idx] / (float)nb;  // Average gradient over batch
+		velocity_b[idx] = MOMENTUM_COEF * velocity_b[idx] + grad;
+		biases[idx] -= lr * velocity_b[idx];
+		grad_b[idx] = 0.0f;  // Reset for next batch
+	}
+#elif OPTIMIZER_TYPE == 2 // Adam
+	// Apply Adam update to weights
+	if (idx < num_weights){
+		float grad = grad_w[idx] / (float)nb;  // Average gradient over batch
+		m_w[idx] = ADAM_BETA1 * m_w[idx] + (1.0f - ADAM_BETA1) * grad;
+		v_w[idx] = ADAM_BETA2 * v_w[idx] + (1.0f - ADAM_BETA2) * grad * grad;
+		float m_hat = m_w[idx] / (1.0f - powf(ADAM_BETA1, (float)epoch));
+		float v_hat = v_w[idx] / (1.0f - powf(ADAM_BETA2, (float)epoch));
+		weights[idx] -= lr * m_hat / (sqrtf(v_hat) + ADAM_EPSILON);
+		grad_w[idx] = 0.0f;  // Reset for next batch
+	}
+	// Apply Adam update to biases
+	if (idx < num_biases){
+		float grad = grad_b[idx] / (float)nb;  // Average gradient over batch
+		m_b[idx] = ADAM_BETA1 * m_b[idx] + (1.0f - ADAM_BETA1) * grad;
+		v_b[idx] = ADAM_BETA2 * v_b[idx] + (1.0f - ADAM_BETA2) * grad * grad;
+		float m_hat = m_b[idx] / (1.0f - powf(ADAM_BETA1, (float)epoch));
+		float v_hat = v_b[idx] / (1.0f - powf(ADAM_BETA2, (float)epoch));
+		biases[idx] -= lr * m_hat / (sqrtf(v_hat) + ADAM_EPSILON);
+		grad_b[idx] = 0.0f;  // Reset for next batch
+	}
+#endif
+}
+
+__global__ void one_learning_cycle(float* train_image, int* train_label, float* weights,
+ float* biases, float* deltas, float* a_list, float* z_list, int* batch_d, int output_type,
+ struct network_structure ns, int nb, float alpha_nb, int epoch
+#if OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2 // Momentum or Adam (use gradient buffers)
+ , float* grad_w, float* grad_b  // Gradient accumulation buffers
+ , float* velocity_w, float* velocity_b  // Not used in kernel, only for signature compatibility
+#endif
+#if OPTIMIZER_TYPE == 2 // Adam
+ , float* m_w, float* v_w, float* m_b, float* v_b  // Not used in kernel
+#endif
 #if USE_BATCH_NORM
  , float* bn_gamma, float* bn_beta, float* bn_mean, float* bn_var, float* dgamma, float* dbeta
+#if OPTIMIZER_TYPE == 1 // Momentum
+ , float* velocity_bn_gamma, float* velocity_bn_beta
+#elif OPTIMIZER_TYPE == 2 // Adam
+ , float* m_bn_gamma, float* v_bn_gamma, float* m_bn_beta, float* v_bn_beta
+#endif
 #endif
 ){
 
@@ -1038,36 +1096,32 @@ __global__ void one_learning_cycle(float* train_image, int* train_label, float* 
 #endif
 		}
 
-		// gradient descent with selected optimizer
+		// Phase 1: Gradient accumulation (all optimizers)
+		// For SGD: accumulate and apply immediately (backward compatible)
+		// For Momentum/Adam: accumulate only, apply later in separate kernel
 		for (int l=0; l<ns.L-1; l++){
-			// Bias updates
+			// Bias gradients
 			for (int j=0; j<ns.layers[l+1]; j++){
-				float grad_b = delta[ns.dza_pstn[l+1]+j];
+				float local_grad_b = delta[ns.dza_pstn[l+1]+j];
 				int bias_idx = ns.biases_pstn[l]+j;
 
-#if OPTIMIZER_TYPE == 0 // SGD
-				atomicAdd(&biases[bias_idx], (-alpha_nb) * grad_b);
-#elif OPTIMIZER_TYPE == 1 // Momentum
-				update_param_momentum(&biases[bias_idx], grad_b, &velocity_b[bias_idx], alpha_nb, MOMENTUM_COEF);
-#elif OPTIMIZER_TYPE == 2 // Adam
-				update_param_adam(&biases[bias_idx], grad_b, &m_b[bias_idx], &v_b[bias_idx],
-					alpha_nb, ADAM_BETA1, ADAM_BETA2, ADAM_EPSILON, epoch + 1);
+#if OPTIMIZER_TYPE == 0 // SGD - direct update (original behavior)
+				atomicAdd(&biases[bias_idx], (-alpha_nb) * local_grad_b);
+#elif OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2 // Momentum or Adam - accumulate only
+				atomicAdd(&grad_b[bias_idx], local_grad_b);  // Accumulate gradient
 #endif
 			}
 
-			// Weight updates
+			// Weight gradients
 			for (int i=0; i<ns.layers[l]; i++){
 				for (int j=0; j<ns.layers[l+1]; j++){
-					float grad_w = delta[ns.dza_pstn[l+1]+j] * a[ns.dza_pstn[l]+i];
+					float local_grad_w = delta[ns.dza_pstn[l+1]+j] * a[ns.dza_pstn[l]+i];
 					int weight_idx = ns.weights_pstn[l]+i*ns.layers[l+1]+j;
 
-#if OPTIMIZER_TYPE == 0 // SGD
-					atomicAdd(&weights[weight_idx], (-alpha_nb) * grad_w);
-#elif OPTIMIZER_TYPE == 1 // Momentum
-					update_param_momentum(&weights[weight_idx], grad_w, &velocity_w[weight_idx], alpha_nb, MOMENTUM_COEF);
-#elif OPTIMIZER_TYPE == 2 // Adam
-					update_param_adam(&weights[weight_idx], grad_w, &m_w[weight_idx], &v_w[weight_idx],
-						alpha_nb, ADAM_BETA1, ADAM_BETA2, ADAM_EPSILON, epoch + 1);
+#if OPTIMIZER_TYPE == 0 // SGD - direct update (original behavior)
+					atomicAdd(&weights[weight_idx], (-alpha_nb) * local_grad_w);
+#elif OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2 // Momentum or Adam - accumulate only
+					atomicAdd(&grad_w[weight_idx], local_grad_w);  // Accumulate gradient
 #endif
 				}
 			}
@@ -1303,13 +1357,19 @@ int main(const int argc, const char** argv){
 	assert(cudaMalloc((void **) &batch_d, nb*sizeof(int))==cudaSuccess);
 
 	// Allocate GPU memory for optimizer state
-#if OPTIMIZER_TYPE == 1 // Momentum
+#if OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2 // Momentum or Adam (both need velocity for kernel signature)
 	float *velocity_w_d, *velocity_b_d;
 	assert(cudaMalloc((void **) &velocity_w_d, num_weights*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &velocity_b_d, num_biases*sizeof(float))==cudaSuccess);
+#endif
+
+#if OPTIMIZER_TYPE == 1 // Momentum
 	assert(cudaMemcpy(velocity_w_d, velocity_w, num_weights*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(velocity_b_d, velocity_b, num_biases*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 #elif OPTIMIZER_TYPE == 2 // Adam
+	cudaMemset(velocity_w_d, 0, num_weights*sizeof(float));  // Dummy (not used)
+	cudaMemset(velocity_b_d, 0, num_biases*sizeof(float));
+
 	float *m_w_d, *v_w_d, *m_b_d, *v_b_d;
 	assert(cudaMalloc((void **) &m_w_d, num_weights*sizeof(float))==cudaSuccess);
 	assert(cudaMalloc((void **) &v_w_d, num_weights*sizeof(float))==cudaSuccess);
@@ -1319,6 +1379,14 @@ int main(const int argc, const char** argv){
 	assert(cudaMemcpy(v_w_d, v_w, num_weights*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(m_b_d, m_b, num_biases*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
 	assert(cudaMemcpy(v_b_d, v_b, num_biases*sizeof(float), cudaMemcpyHostToDevice)==cudaSuccess);
+#endif
+
+#if OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2 // Gradient buffers for Momentum/Adam
+	float *grad_w_d, *grad_b_d;
+	assert(cudaMalloc((void **) &grad_w_d, num_weights*sizeof(float))==cudaSuccess);
+	assert(cudaMalloc((void **) &grad_b_d, num_biases*sizeof(float))==cudaSuccess);
+	cudaMemset(grad_w_d, 0, num_weights*sizeof(float));  // Initialize to zero
+	cudaMemset(grad_b_d, 0, num_biases*sizeof(float));
 #endif
 
 #if USE_BATCH_NORM
@@ -1412,21 +1480,52 @@ int main(const int argc, const char** argv){
 		cudaMemset(dbeta_d, 0, ns.num_bn_params*sizeof(float));
 #endif
 
+#if OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2
+		// Zero out gradient buffers for Momentum/Adam
+		cudaMemset(grad_w_d, 0, num_weights*sizeof(float));
+		cudaMemset(grad_b_d, 0, num_biases*sizeof(float));
+#endif
+
 		/* --- main part --- */
 		cudaEventRecord( start_device, 0 ); // record cuda start time
 
-		// one learning cycle (feedforward & backpropagate & gradient descend)
+		// Phase 1: Gradient accumulation (feedforward & backpropagate & accumulate gradients)
 		one_learning_cycle<<<nblocks, nthreads>>>(train_image_d, train_label_d,
 			weights_d, biases_d, deltas_d, a_list_d, z_list_d, batch_d, output_type, ns, nb, alpha_nb, epoch
+#if OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2 // Momentum or Adam
+			, grad_w_d, grad_b_d  // Gradient buffers
+			, velocity_w_d, velocity_b_d  // Optimizer state (unused in kernel)
+#endif
+#if OPTIMIZER_TYPE == 2 // Adam
+			, m_w_d, v_w_d, m_b_d, v_b_d  // Optimizer state (unused in kernel)
+#endif
+#if USE_BATCH_NORM
+			, bn_gamma_d, bn_beta_d, bn_mean_d, bn_var_d, dgamma_d, dbeta_d
+#if OPTIMIZER_TYPE == 1 // Momentum
+			, velocity_bn_gamma_d, velocity_bn_beta_d
+#elif OPTIMIZER_TYPE == 2 // Adam
+			, m_bn_gamma_d, v_bn_gamma_d, m_bn_beta_d, v_bn_beta_d
+#endif
+#endif
+		);
+
+#if OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2
+		// Phase 2: Apply optimizer updates (Momentum/Adam only)
+		cudaDeviceSynchronize();  // Wait for gradient accumulation to complete
+		int opt_nthreads = 256;
+		int opt_nblocks_w = (num_weights + opt_nthreads - 1) / opt_nthreads;
+		int opt_nblocks_b = (num_biases + opt_nthreads - 1) / opt_nthreads;
+		int opt_nblocks = max(opt_nblocks_w, opt_nblocks_b);
+
+		apply_optimizer_update<<<opt_nblocks, opt_nthreads>>>(
+			weights_d, biases_d, grad_w_d, grad_b_d, num_weights, num_biases, current_lr, nb, epoch + 1
 #if OPTIMIZER_TYPE == 1 // Momentum
 			, velocity_w_d, velocity_b_d
 #elif OPTIMIZER_TYPE == 2 // Adam
 			, m_w_d, v_w_d, m_b_d, v_b_d
 #endif
-#if USE_BATCH_NORM
-			, bn_gamma_d, bn_beta_d, bn_mean_d, bn_var_d, dgamma_d, dbeta_d
-#endif
 		);
+#endif
 
 		cudaEventRecord( stop_device, 0 ); // record cuda finish time
 		cudaEventSynchronize( stop_device );
@@ -1457,12 +1556,19 @@ int main(const int argc, const char** argv){
 	cudaFree(a_list_d); cudaFree(train_image_d); cudaFree(train_label_d);
 	cudaFree(test_image_d); cudaFree(test_label_d); cudaFree(batch_d);
 
-#if OPTIMIZER_TYPE == 1 // Momentum
+#if OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2 // Momentum or Adam
 	cudaFree(velocity_w_d); cudaFree(velocity_b_d);
+#endif
+
+#if OPTIMIZER_TYPE == 1 // Momentum
 	free(velocity_w); free(velocity_b);
 #elif OPTIMIZER_TYPE == 2 // Adam
 	cudaFree(m_w_d); cudaFree(v_w_d); cudaFree(m_b_d); cudaFree(v_b_d);
 	free(m_w); free(v_w); free(m_b); free(v_b);
+#endif
+
+#if OPTIMIZER_TYPE == 1 || OPTIMIZER_TYPE == 2 // Gradient buffers
+	cudaFree(grad_w_d); cudaFree(grad_b_d);
 #endif
 
 #if USE_BATCH_NORM

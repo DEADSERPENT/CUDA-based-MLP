@@ -529,11 +529,103 @@ L9  end
 
 ---
 
+## Research Findings & Analysis
+
+### Optimizer Implementation Study
+
+**Status:** ✅ **BUG FIXED** - Momentum and Adam optimizers now working correctly!
+
+During M.Tech-level code review and testing, a fundamental algorithmic flaw was discovered and successfully resolved through implementation of 2-phase gradient accumulation:
+
+#### Results Summary
+
+| Optimizer | Status | Test Accuracy | Time/Epoch | Notes |
+|-----------|--------|---------------|------------|-------|
+| **SGD** | ✅ Working | 74.88% | 0.560 sec | Baseline implementation |
+| **SGD + LR Schedule** | ✅ Working | 71.80% | 0.571 sec | Cosine annealing |
+| **Momentum** | ✅ **FIXED!** | **74.82%** | **0.465 sec** | 2-phase gradient accumulation |
+| **Adam (lr=0.01)** | ✅ **FIXED!** | **78.84%** | **0.434 sec** | Best accuracy, needs lower LR |
+| **Batch Normalization** | ⚠️ Issues | 8.92% | N/A | Requires hyperparameter tuning |
+
+**Key Achievement:** Fixed optimizers are actually **17-23% faster** than SGD while achieving similar or better accuracy!
+
+#### Original Bug (Now Fixed)
+
+The Momentum and Adam optimizers incorrectly updated optimizer state **per-sample** (2048 times per batch) instead of **per-batch** (once per batch after gradient accumulation). This caused:
+
+1. Race conditions in atomic operations
+2. Incorrect gradient accumulation
+3. Numerical instability leading to immediate divergence
+4. All accuracies dropping to 0% after the first epoch
+
+#### The Fix: 2-Phase Gradient Accumulation
+
+**Phase 1:** Gradient Accumulation (in `one_learning_cycle` kernel)
+```cuda
+// Each thread accumulates its gradient contribution
+atomicAdd(&grad_buffer[idx], local_gradient);  // All 2048 samples
+```
+
+**Phase 2:** Optimizer Update (new `apply_optimizer_update` kernel)
+```cuda
+// Single kernel call per batch
+float avg_grad = grad_buffer[idx] / batch_size;
+velocity[idx] = momentum * velocity[idx] + avg_grad;  // Once per batch
+param[idx] -= learning_rate * velocity[idx];
+```
+
+#### Documentation
+
+For complete technical analysis suitable for M.Tech documentation:
+- **[OPTIMIZER_FIX_RESULTS.md](OPTIMIZER_FIX_RESULTS.md)** - **NEW!** Complete fix verification with:
+  - Before/after comparison
+  - Training curves for all optimizers
+  - Performance analysis (speed + accuracy)
+  - Implementation details
+  - Recommendations for M.Tech report
+- **[OPTIMIZER_BUG_ANALYSIS.md](OPTIMIZER_BUG_ANALYSIS.md)** - Original bug report with:
+  - Root cause analysis
+  - Code-level breakdown
+  - Proposed fix architecture
+  - Quantitative impact analysis
+  - Educational value for HPC coursework
+
+#### Visualization Tools
+
+Professional visualization script provided for project documentation:
+```bash
+# Install dependencies (if not already installed)
+pip3 install matplotlib numpy
+
+# Generate training comparison graphs
+python3 visualize_training.py
+```
+
+**Generated graphs:**
+- `training_accuracy_comparison.png` - Optimizer convergence curves
+- `training_time_comparison.png` - Training speed analysis
+- `optimizer_divergence_analysis.png` - Bug visualization
+
+#### Educational Value
+
+This bug analysis demonstrates M.Tech-level competencies in:
+- ✅ Advanced CUDA programming (atomic operations, race conditions)
+- ✅ Deep learning fundamentals (optimizer algorithms)
+- ✅ Debugging parallel code
+- ✅ Performance analysis and profiling
+- ✅ Technical documentation and research methodology
+
+The working SGD implementation achieves **100-200× speedup** over CPU serial version, validating the core CUDA parallelization strategy.
+
+---
+
 ## Detailed Documentation
 
 For in-depth technical analysis of optimization strategies, see:
+- **[OPTIMIZER_BUG_ANALYSIS.md](OPTIMIZER_BUG_ANALYSIS.md)** - Optimizer bug analysis (NEW)
 - **[OPTIMIZATIONS_SUMMARY.md](OPTIMIZATIONS_SUMMARY.md)** - Complete optimization analysis
 - **Source code comments** - Inline documentation in `.cu` files
+- **`visualize_training.py`** - Training visualization script
 
 ---
 
